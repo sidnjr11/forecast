@@ -45,11 +45,18 @@ def run_validation(file_path):
         # Read input data
         df = pd.read_excel(file_path, sheet_name="HistoricalData")
         
-        # Validation logic
+        # Check for required columns
+        required_cols = {"SKU", "Date", "Quantity"}
+        if not required_cols.issubset(df.columns):
+            print(f"Missing required columns: {required_cols - set(df.columns)}", file=sys.stderr)
+            return False
+        
+        # Convert Date column to datetime for robust validation
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        
         issues = []
         setting_suggestions = []
         
-        # Data quality checks
         for idx, row in df.iterrows():
             row_num = idx + 2
             sku = str(row.get("SKU", "")).strip()
@@ -59,25 +66,21 @@ def run_validation(file_path):
             # SKU validation
             if not sku:
                 issues.append([row_num, sku, date, qty, "Missing SKU"])
-                
+            
             # Date validation
             if pd.isna(date):
-                issues.append([row_num, sku, date, qty, "Missing Date"])
-            elif isinstance(date, pd.Timestamp):
-                if date.year < 2000 or date.year > 2099:
-                    issues.append([row_num, sku, date, qty, "Date out of valid range"])
-            else:
-                issues.append([row_num, sku, date, qty, "Invalid Date format"])
+                issues.append([row_num, sku, date, qty, "Missing or invalid Date"])
+            elif not (2000 <= date.year <= 2099):
+                issues.append([row_num, sku, date, qty, "Date out of valid range"])
 
-            # Quantity validation
-            if pd.isna(qty):
-                issues.append([row_num, sku, date, qty, "Missing Quantity"])
-            elif not isinstance(qty, (int, float)):
-                issues.append([row_num, sku, date, qty, "Quantity is not numeric"])
-            elif qty < 0:
+            # Quantity validation - try to coerce to numeric
+            qty_num = pd.to_numeric(qty, errors='coerce')
+            if pd.isna(qty_num):
+                issues.append([row_num, sku, date, qty, "Missing or non-numeric Quantity"])
+            elif qty_num < 0:
                 issues.append([row_num, sku, date, qty, "Negative Quantity"])
 
-        # Group-level checks
+        # Group-level checks and suggestions
         grouped = df.groupby("SKU")
         for sku, group in grouped:
             if group["Quantity"].count() < 4:
@@ -86,7 +89,7 @@ def run_validation(file_path):
                 issues.append(["-", sku, "-", "-", "All quantities are zero"])
 
             # Analysis suggestions
-            grain = detect_grain(group["Date"])
+            grain = detect_grain(group["Date"].dropna())
             hist_window = "6M" if len(group) >= 180 else "3M"
             seasonality = detect_seasonality(group["Quantity"].fillna(0))
             model = suggest_model(group["Quantity"].fillna(0))

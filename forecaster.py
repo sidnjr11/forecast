@@ -23,10 +23,10 @@ def run_forecasting(input_file):
             return False
 
         print("Processing data...")
-        processed_df = process_data(df, settings)
+        processed_df, outlier_flags = process_data(df, settings)
         
         print("Generating forecasts...")
-        forecast_df = generate_forecasts_with_settings(processed_df, settings)
+        forecast_df = generate_forecasts_with_settings(processed_df, settings, outlier_flags)
         
         if settings['Include Charts']:
             print("Creating charts...")
@@ -34,6 +34,9 @@ def run_forecasting(input_file):
         
         print("Saving report...")
         save_report(forecast_df, output_dir)
+
+        # Save summary Excel
+        write_summary_excel(forecast_df, output_dir, settings)
         
         print(f"\nForecast completed! Results saved to: {os.path.abspath(output_dir)}")
         return True
@@ -59,7 +62,7 @@ def load_data_and_settings(file_path):
                 return str(value).strip()  # Keep full string for method names
             except:
                 return default
-        
+                
         settings = {
             'Forecast Period': get_setting('Forecast Period', 'Monthly'),
             'Historical Window': get_setting('Historical Window', '12M'),
@@ -127,45 +130,70 @@ def load_data_and_settings(file_path):
         return None, None
 
 def process_data(df, settings):
-    """Handle outlier removal if enabled"""
+    """
+    Remove outliers if enabled. 
+    Return processed_df and a set of (SKU, Date, Quantity) tuples that were outliers.
+    """
     if not settings['Remove Outliers']:
-        return df
+        df['Outliers_Removed'] = False
+        return df, set()
     
     processed_data = []
+    outlier_flags = set()  # Set of tuples: (SKU, Date, Quantity)
     for sku, group in df.groupby('SKU'):
         group = group.sort_values('Date')
         values = group['Quantity'].values
-        
-        if len(values) > 5:  # Only remove outliers if we have enough data
-            z_scores = zscore(values)
-            filtered = group[(np.abs(z_scores) < 3)]
-            if len(filtered) > 0:  # Only keep if we have data left
-                processed_data.append(filtered)
-            else:
-                processed_data.append(group)  # Fallback to original if all removed
-        else:
-            processed_data.append(group)
-    
-    return pd.concat(processed_data).sort_values(['SKU', 'Date'])
 
-def generate_forecasts_with_settings(df, settings):
+        if len(values) > 5:
+            z_scores = zscore(values)
+            outlier_mask = np.abs(z_scores) >= 3
+            # Mark the outliers in the original DataFrame
+            outlier_rows = group[outlier_mask]
+            for _, row in outlier_rows.iterrows():
+                outlier_flags.add((row['SKU'], row['Date'], row['Quantity']))
+            # Only keep non-outlier rows
+            group = group[~outlier_mask]
+        processed_data.append(group)
+    
+    processed_df = pd.concat(processed_data).sort_values(['SKU', 'Date'])
+    processed_df['Outliers_Removed'] = False  # Set all kept rows to False; true flags added later in generate_forecasts_with_settings
+    return processed_df, outlier_flags
+
+def generate_forecasts_with_settings(df, settings, outlier_flags):
     """Generate forecasts with strict method adherence"""
     forecasts = []
     horizon = settings['horizon']
     freq = settings['freq']
     ci_z = norm.ppf(settings['Confidence Interval'] / 100)
-    
+    all_rows = []
+
+    # Set Outliers_Removed flag for historical data
+    df = df.copy()
+    df['Outliers_Removed'] = [
+        (row['SKU'], row['Date'], row['Quantity']) in outlier_flags
+        for _, row in df.iterrows()
+    ]
+
     for sku, group in df.groupby('SKU'):
         group = group.sort_values('Date')
         values = group['Quantity'].values
-        dates = group['Date'].values
         last_date = group['Date'].max()
         method_used = settings['Forecast Method']
-        
+
+        # HISTORICAL rows
+        hist = group.copy()
+        hist['Forecast'] = np.nan
+        hist['Lower_CI'] = np.nan
+        hist['Upper_CI'] = np.nan
+        hist['Method'] = ""
+        hist['Data_Points'] = len(values)
+        # hist['Outliers_Removed'] already set above
+        all_rows.append(hist)
+
         try:
             if len(values) < 3:
                 raise ValueError(f"Insufficient data points ({len(values)}) for {method_used}")
-            
+
             # STRICT METHOD SELECTION - NO AUTO FALLBACK
             if method_used == 'Linear Trend':
                 x = np.arange(len(values))
@@ -191,7 +219,7 @@ def generate_forecasts_with_settings(df, settings):
                 forecast, method_used = auto_select_forecast(values, horizon, settings)
             else:
                 raise ValueError(f"Unknown forecast method: {method_used}")
-            
+
             # Generate forecast dates
             if freq == 'D':
                 forecast_dates = pd.date_range(start=last_date + timedelta(days=1), periods=horizon)
@@ -199,7 +227,7 @@ def generate_forecasts_with_settings(df, settings):
                 forecast_dates = pd.date_range(start=last_date + timedelta(weeks=1), periods=horizon, freq='W-MON')
             else:  # Monthly
                 forecast_dates = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=horizon, freq='M')
-            
+
             # Calculate confidence intervals
             std = values.std() if len(values) > 1 else max(values[0]*0.1, 1)
             for i, date in enumerate(forecast_dates):
@@ -212,19 +240,22 @@ def generate_forecasts_with_settings(df, settings):
                     'Upper_CI': max(0, round(forecast[i] + ci_z * std, 2)),
                     'Method': method_used,
                     'Data_Points': len(values),
-                    'Outliers_Removed': settings['Remove Outliers']
+                    'Outliers_Removed': False  # Forecasts are never outliers
                 })
-                
+
         except Exception as e:
             print(f"Forecast failed for {sku} using {method_used} - {str(e)}")
-            # Instead of falling back, we'll skip this SKU entirely
             continue
-    
-    return pd.concat([df, pd.DataFrame(forecasts)]).sort_values(['SKU', 'Date'])
+
+    if forecasts:
+        forecast_rows = pd.DataFrame(forecasts)
+        result_df = pd.concat(all_rows + [forecast_rows]).sort_values(['SKU', 'Date'])
+    else:
+        result_df = pd.concat(all_rows).sort_values(['SKU', 'Date'])
+    return result_df
 
 def auto_select_forecast(values, horizon, settings):
     """Auto-select best method only when Default is chosen"""
-    # Use last 25% of data for validation if we have enough
     val_size = max(3, min(6, len(values) // 4))
     train, test = values[:-val_size], values[-val_size:]
     
@@ -304,7 +335,7 @@ def create_visualizations(df, output_dir, settings):
         fig.add_trace(go.Scatter(
             x=historical['Date'],
             y=historical['Quantity'],
-            name='Actual' + (' (Outliers Removed)' if settings['Remove Outliers'] else ''),
+            name='Actual' + (' (Some Outliers Removed)' if historical['Outliers_Removed'].any() else ''),
             line=dict(color='blue', width=2),
             mode='lines+markers'
         ))
@@ -351,7 +382,7 @@ def create_visualizations(df, output_dir, settings):
         # Matplotlib chart
         plt.figure(figsize=(12, 6))
         plt.plot(historical['Date'], historical['Quantity'], 
-                label='Actual' + (' (Outliers Removed)' if settings['Remove Outliers'] else ''), 
+                label='Actual' + (' (Some Outliers Removed)' if historical['Outliers_Removed'].any() else ''), 
                 color='blue')
         
         if not forecast_data.empty:
@@ -375,11 +406,7 @@ def create_visualizations(df, output_dir, settings):
 def save_report(df, output_dir):
     """Save results to Excel with all metadata"""
     try:
-        # Prepare the report with additional columns
         report_df = df.copy()
-        report_df['Outliers_Removed'] = report_df['Outliers_Removed'].fillna(method='ffill')
-        report_df['Data_Points'] = report_df['Data_Points'].fillna(method='ffill')
-        
         report_df.to_excel(
             os.path.join(output_dir, "forecast_results.xlsx"),
             index=False,
@@ -387,6 +414,36 @@ def save_report(df, output_dir):
         )
     except Exception as e:
         print(f"Report saved with warnings: {str(e)}")
+
+def write_summary_excel(df, output_dir, settings):
+    """
+    Write a summary Excel file for all SKUs in forecast output.
+    Each row = 1 SKU, with method, data points, outlier status, suggestion.
+    """
+    summary_rows = []
+    for sku, group in df.groupby('SKU'):
+        forecast_rows = group[group['Quantity'].isna()]
+        method = forecast_rows['Method'].iloc[0] if not forecast_rows.empty and 'Method' in forecast_rows else 'N/A'
+        data_points = group['Data_Points'].max() if 'Data_Points' in group else len(group[group['Quantity'].notna()])
+        outliers = group['Outliers_Removed'].any() if 'Outliers_Removed' in group else False
+        suggestion = ""
+        if data_points < 6:
+            suggestion = "Short history—consider more data."
+        elif "Seasonal" in str(method) and data_points < 24:
+            suggestion = "Seasonal method with limited data—results may be unreliable."
+        else:
+            suggestion = "OK"
+        summary_rows.append({
+            "SKU": sku,
+            "Method Used": method,
+            "Data Points": data_points,
+            "Outliers Removed": outliers,
+            "Suggestion": suggestion
+        })
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(output_dir, "forecast_summary.xlsx")
+    summary_df.to_excel(summary_path, index=False)
+    print(f"Summary saved to {summary_path}")
 
 if __name__ == "__main__":
     input_file = "your_input_file.xlsx"  # Change to your file path
