@@ -1,0 +1,31 @@
+📦 Upstrail Reorder Quantity Suggestor Plugin – version.txt
+
+Version: 1.1
+Release Date: 2025-05-25
+
+What's New:
+- Reorder Point logic added: flags reorder only when inventory < ROP.
+- Suggested Quantity now considers EOQ override, else ROP gap.
+- Output includes: Reorder Point, Reorder Flag (YES/NO), Suggested Qty.
+- Dynamic headers and columns in Inventory based on toggles.
+- Sales vs Forecast toggle controls demand source.
+- Full data validator with ValidationLog sheet.
+- Export-to-PDF and macro run logging via Log sheet.
+
+Environment:
+- Excel 2016 or later (Windows only)
+- Macros must be enabled
+- Fully offline, Excel-native plugin
+
+Security:
+- All VBA code is password protected for integrity
+- No external servers or API calls
+
+Bundle Includes:
+- Excel Plugin (.xlsm)
+- Readme_Upstrail_RQS_v1.1_FINAL.txt
+- version_RQS_1.1.txt
+
+Contact:
+Email: siddharth@upstrail.com
+Website: www.upstrail.com
